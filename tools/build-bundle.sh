@@ -26,6 +26,7 @@ FILES=(
   app-state.js
   dev-settings.js
   catalog.js
+  letsplay.js
   personal.js
   profiles.js
   ui-overlays.js
