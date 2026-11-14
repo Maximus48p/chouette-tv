@@ -64,10 +64,12 @@ var App = App || {};
 
     App.mergePersonalList = function (catalog) {
         var live = [], vod = [], entries = list(), item, cat;
-        var liveCats = [], vodCats = [], seen = {};
+        var liveCats = [], vodCats = [], seen = {}, ids = {};
         for (var i = 0; i < entries.length; i++) {
             item = toItem(entries[i]);
-            if (!item) { continue; }
+            /* One item per address: a hand-made entry wins over the same video found through a followed team. */
+            if (!item || ids[item.id]) { continue; }
+            ids[item.id] = true;
             (item.kind === 'live' ? live : vod).push(item);
             if (!seen[item.kind + item.categoryId]) {
                 seen[item.kind + item.categoryId] = true;

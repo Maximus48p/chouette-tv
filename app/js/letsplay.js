@@ -50,16 +50,19 @@ var LetsPlay = (function () {
         return out;
     }
 
-    /* Video address of a free match page: { url, live } or null (paid, or nothing to play yet). */
-    function parseWatch(html) {
+    function escapeRe(s) { return String(s).replace(/[.*+?^${}()|[\]\\\/]/g, '\\$&'); }
+
+    /* Video of match `id` on its page: { url, live } or null. Fails closed: the page must declare an
+     * empty price plan, and the address must be the one the player gets for this match id
+     * (player call: '<media>', '<id>', '<start>', '<end>', '<url>'), never another video on the page. */
+    function parseWatch(html, id) {
         html = String(html);
-        var plan = /window\.pricePlanID\s*=\s*'([^']*)'/.exec(html);
-        if (plan && plan[1]) { return null; }
-        var mp4 = /https:\/\/vod\.usf\.sport\/[^"'\s`]+\.mp4/.exec(html);
-        if (mp4) { return { url: mp4[0], live: false }; }
-        var hls = /https:\/\/media\.usf\.sport\/hls\/[^"'\s`]+\.m3u8/.exec(html);
-        if (hls) { return { url: hls[0], live: true }; }
-        return null;
+        var plan = /window\.pricePlanID\s*=\s*(['"])([^'"]*)\1/.exec(html);
+        if (!plan || plan[2]) { return null; }
+        var player = new RegExp('[\'"]' + escapeRe(id) + '[\'"]\\s*,\\s*[\'"][^\'"]*[\'"]\\s*,\\s*[\'"][^\'"]*[\'"]\\s*,\\s*' +
+            '[\'"](https:\\/\\/(?:vod\\.usf\\.sport\\/(?:[^\'"\\s]+\\/)?[^\'"\\s\\/]+\\.mp4|media\\.usf\\.sport\\/hls\\/[^\'"\\s\\/]+\\.m3u8))[\'"]').exec(html);
+        if (!player) { return null; }
+        return { url: player[1], live: /\.m3u8$/.test(player[1]) };
     }
 
     return { SITE: SITE, teamSlug: teamSlug, parseDate: parseDate, parseSearch: parseSearch, parseWatch: parseWatch };
@@ -68,13 +71,34 @@ var LetsPlay = (function () {
 (function (App) {
     'use strict';
     var CACHE_KEY = 'chouette-tv.household.letsplay';
-    var MAX_PAGES_PER_RUN = 25;
+    var MAX_PAGES_PER_RUN = 60;
+    var RETRY_EMPTY_MS = 24 * 60 * 60 * 1000;
+    var RECENT_MS = 48 * 60 * 60 * 1000;
     var REFRESH_MS = 2 * 60 * 60 * 1000;
-    var running = false;
+    var REAPPLY_RETRY_MS = 60 * 1000;
+    var running = false, reapplyTimer = null;
 
     function follows() {
         return typeof PersonalFollow !== 'undefined' && Object.prototype.toString.call(PersonalFollow) === '[object Array]'
             ? PersonalFollow : [];
+    }
+
+    function followedSlugs() {
+        var bySlug = {}, teams = follows();
+        for (var i = 0; i < teams.length; i++) {
+            if (teams[i] && teams[i].team) { bySlug[LetsPlay.teamSlug(teams[i].team)] = String(teams[i].team); }
+        }
+        return bySlug;
+    }
+
+    function teamOrder() {
+        var order = {}, teams = follows();
+        for (var i = 0; i < teams.length; i++) {
+            if (teams[i] && teams[i].team && order[LetsPlay.teamSlug(teams[i].team)] === undefined) {
+                order[LetsPlay.teamSlug(teams[i].team)] = i;
+            }
+        }
+        return order;
     }
 
     function loadCache() {
@@ -85,77 +109,125 @@ var LetsPlay = (function () {
         return { matches: {} };
     }
 
+    /* Only matches of followed teams are kept. */
     function saveCache(data) {
+        var keep = {}, bySlug = followedSlugs(), id;
+        for (id in data.matches) {
+            if (Object.prototype.hasOwnProperty.call(data.matches, id) && data.matches[id] && bySlug[data.matches[id].team]) {
+                keep[id] = data.matches[id];
+            }
+        }
+        data.matches = keep;
         try { window.localStorage.setItem(CACHE_KEY, JSON.stringify(data)); } catch (e) { /* kept in memory only */ }
     }
 
     var cache = null;
     function getCache() { if (!cache) { cache = loadCache(); } return cache; }
 
-    /* Followed matches as personal-list entries (newest first), for personal.js. */
+    /* Followed matches with a video, as personal-list entries for personal.js: teams in the order they
+     * are followed, newest match first within a team. */
     App.followedEntries = function () {
-        var list = [], matches = getCache().matches, teams = follows(), byTeam = {}, i, id, m;
-        for (i = 0; i < teams.length; i++) { byTeam[LetsPlay.teamSlug(teams[i].team)] = teams[i].team; }
+        var list = [], matches = getCache().matches, bySlug = followedSlugs(), order = teamOrder(), id, m;
         for (id in matches) {
             if (!Object.prototype.hasOwnProperty.call(matches, id)) { continue; }
             m = matches[id];
-            if (!m || !m.url || !byTeam[m.team]) { continue; }
+            if (!m || !m.url || !bySlug[m.team]) { continue; }
             list.push({ name: m.name + (m.date ? ' · ' + m.date.slice(8, 10) + '-' + m.date.slice(5, 7) + '-' + m.date.slice(0, 4) : ''),
-                url: m.url, date: m.date, logo: m.thumb || '', live: !!m.live, group: byTeam[m.team] });
+                url: m.url, date: m.date || '', logo: m.thumb || '', live: !!m.live, group: bySlug[m.team], rank: order[m.team] });
         }
-        list.sort(function (a, b) { return a.date < b.date ? 1 : (a.date > b.date ? -1 : 0); });
+        list.sort(function (a, b) {
+            if (a.rank !== b.rank) { return a.rank - b.rank; }
+            return a.date < b.date ? 1 : (a.date > b.date ? -1 : 0);
+        });
         return list;
     };
 
+    /* Redraw the catalog only while browsing and no catalog load is running; otherwise try again later. */
     function reapplyCatalog() {
         if (!App.catalog || typeof App.applyCatalogSoft !== 'function') { return; }
+        clearTimeout(reapplyTimer);
+        var playing = typeof App.playingItem === 'function' && App.playingItem();
+        if (App.catalogRequestActive || App.catalogRefreshing || App.uiState !== 'browse' || playing) {
+            reapplyTimer = setTimeout(reapplyCatalog, REAPPLY_RETRY_MS);
+            return;
+        }
         var creds = App.xtreamCreds || {};
         App.applyCatalogSoft({ live: App.catalog.live, vod: App.catalog.vod, series: App.catalog.series,
             epgUrl: App.headerEpgUrl || '', base: creds.base || '', username: creds.username || '', password: creds.password || '' });
     }
 
-    /* One pass over all followed teams. get(url, onDone, onError) is injectable for tests. */
-    App.refreshFollowedTeams = function (done, get) {
+    /* Live matches and matches from the last two days (or still to come) are checked every run, so a
+     * recording shows up soon after the match; older ones without a video once a day. */
+    function needsCheck(known, now) {
+        if (!known) { return true; }
+        if (known.url) { return !!known.live; }
+        var when = known.date ? Date.parse(known.date) : NaN;
+        if (!isNaN(when) && when > now - RECENT_MS) { return true; }
+        return !known.checked || now - known.checked >= RETRY_EMPTY_MS;
+    }
+
+    /* One pass over all followed teams. get(url, onDone, onError) and now (ms) are injectable for tests. */
+    App.refreshFollowedTeams = function (done, get, nowMs) {
         get = get || function (url, ok, fail) { Http.get(url, { timeoutMs: 30000, label: 'Let\'s Play' }, ok, fail); };
         done = done || function () {};
         var teams = follows();
         if (running || !teams.length) { done(false); return; }
         running = true;
-        var data = getCache(), changed = false, pages = 0, queue = [];
-        var t = 0;
+        var data = getCache(), changed = false, pages = 0, queue = [], t = 0, now = nowMs || new Date().getTime();
+
         function finish() {
             running = false;
             if (changed) { saveCache(data); reapplyCatalog(); }
             done(changed);
         }
-        function resolveNext() {
-            if (!queue.length || pages >= MAX_PAGES_PER_RUN) { nextTeam(); return; }
-            var match = queue.shift();
-            pages++;
-            get(LetsPlay.SITE + match.path, function (html) {
-                var found = LetsPlay.parseWatch(html);
-                var old = data.matches[match.id];
-                if (found && (!old || old.url !== found.url || !!old.live !== found.live)) {
+        /* A request whose callbacks throw, or that throws itself, still moves the run on. */
+        function request(url, onText, next) {
+            var moved = false;
+            function step(fn, arg) {
+                if (moved) { return; }
+                moved = true;
+                try { if (fn) { fn(arg); } } catch (e) { /* skip this page */ }
+                next();
+            }
+            try {
+                get(url, function (text) { step(onText, text); }, function () { step(null); });
+            } catch (e2) { step(null); }
+        }
+        function record(match, found) {
+            var old = data.matches[match.id];
+            if (found) {
+                if (!old || old.url !== found.url || !!old.live !== found.live) {
                     data.matches[match.id] = { team: match.team, name: match.name, date: match.date,
                         thumb: match.thumb, url: found.url, live: found.live };
                     changed = true;
                 }
-                resolveNext();
-            }, function () { resolveNext(); });
+            } else {
+                /* Paid, no video yet, or a live match that ended unrecorded (it leaves Live): look again tomorrow. */
+                data.matches[match.id] = { team: match.team, name: match.name, date: match.date, url: '', checked: now };
+                changed = true;
+            }
+        }
+        function resolveNext() {
+            if (!queue.length || pages >= MAX_PAGES_PER_RUN) { nextTeam(); return; }
+            var match = queue.shift();
+            pages++;
+            request(LetsPlay.SITE + match.path, function (html) {
+                record(match, LetsPlay.parseWatch(html, match.id));
+            }, resolveNext);
         }
         function nextTeam() {
+            queue = [];
             if (t >= teams.length) { finish(); return; }
-            var team = teams[t++].team;
-            get(LetsPlay.SITE + '/search?query=' + encodeURIComponent(team), function (html) {
+            var team = teams[t++] && teams[t - 1].team;
+            if (!team) { nextTeam(); return; }
+            request(LetsPlay.SITE + '/search?query=' + encodeURIComponent(team), function (html) {
                 var found = LetsPlay.parseSearch(html, team);
                 for (var i = 0; i < found.length; i++) {
-                    var known = data.matches[found[i].id];
-                    if (known && known.url && !known.live) { continue; }
+                    if (!needsCheck(data.matches[found[i].id], now)) { continue; }
                     found[i].team = LetsPlay.teamSlug(team);
                     queue.push(found[i]);
                 }
-                resolveNext();
-            }, function () { nextTeam(); });
+            }, resolveNext);
         }
         nextTeam();
     };
