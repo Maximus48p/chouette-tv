@@ -13666,7 +13666,19 @@ var App = App || {};
         }
     };
 
-    window.addEventListener('load', App.boot);
+    /* Local patch (household): seed the tv-guide playlist and guide on first launch only.
+       Writes nothing when a playlist or Xtream server is already saved; never blocks start-up. */
+    App.seedSource = function () {
+        try {
+            if (!Storage.get(Storage.KEYS.playlistUrl) && !Storage.get(Storage.KEYS.xtreamServer)) {
+                Storage.set(Storage.KEYS.playlistUrl, 'https://maximus48p.github.io/tv-guide/sports.m3u');
+                if (!Storage.get(Storage.KEYS.epgUrl)) {
+                    Storage.set(Storage.KEYS.epgUrl, 'https://maximus48p.github.io/tv-guide/guide.xml');
+                }
+            }
+        } catch (e) { /* a failed seed only means the settings screen shows, as before */ }
+    };
+    window.addEventListener('load', function (e) { App.seedSource(); App.boot(e); });
 })(App);
 
 
