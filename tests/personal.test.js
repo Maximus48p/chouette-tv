@@ -53,3 +53,16 @@ test('entries without an http(s) address are ignored', () => {
     assert.deepEqual([...items].map((i) => i.url), ['https://example.invalid/a.mp4', entry.url]);
     assert.equal(items[0].name, 'a.mp4');
 });
+
+test('live entries go to the live bucket under their own category; recordings stay films', () => {
+    const live = { name: 'VOC live', url: 'https://example.invalid/hls/cam.m3u8', live: true };
+    const App = load([entry, live]);
+    const cat = App.normalizeCatalog({ live: { categories: [{ id: 's', name: 'Sports' }], items: [{ id: 'x', name: 'X', categoryId: 's', url: 'https://example.invalid/x' }] } });
+    assert.equal(cat.live.categories[0].id, 'personal');
+    const mineLive = cat.live.items.filter((i) => i.categoryId === 'personal');
+    assert.equal(mineLive.length, 1);
+    assert.equal(mineLive[0].kind, 'live');
+    assert.equal(mineLive[0].url, live.url);
+    assert.equal(cat.vod.items.length, 1);
+    assert.equal(App.normalizeCatalog(cat).live.items.length, 2, 'no duplicates on re-normalize');
+});
